@@ -469,6 +469,47 @@ for (const side of ["server", "client"] as const) {
       assert.deepStrictEqual(events, ["error:boom", "close:0"]);
     });
 
+    // The peer's half has ended and its 3000 bytes are unread. close(code) ends the writable, and
+    // that closes the stream while close(code) is still running.
+    test("close(code) in the tick a consumer attaches: the consumer gets the data and 'end'", async () => {
+      const seen: Record<number, string[]> = {};
+      for (const code of [...codes, NGHTTP2_INTERNAL_ERROR]) {
+        seen[code] = await withStream(async (stream, peer) => {
+          if (side === "client") {
+            // A server stream that reads its request stays open after its response.
+            peer.resume();
+            (peer as http2.ServerHttp2Stream).respond({ ":status": 200 });
+          }
+          peer.end(Buffer.alloc(3000, "a"));
+          await once(peer, "finish");
+          // One ping round trip: this side has every frame the peer wrote before its 'finish'.
+          const { promise: pinged, resolve: onPing } = Promise.withResolvers<Error | null>();
+          stream.session!.ping(onPing);
+          assert.strictEqual(await pinged, null);
+
+          const events: string[] = [];
+          const { promise, resolve } = Promise.withResolvers<string[]>();
+          let bytes = 0;
+          stream.on("data", chunk => (bytes += chunk.length));
+          stream.on("aborted", () => events.push("aborted"));
+          stream.on("end", () => events.push("end:" + bytes));
+          stream.on("error", err => events.push("error:" + (err as NodeJS.ErrnoException).code));
+          stream.on("close", () => {
+            events.push("close:" + stream.rstCode);
+            resolve(events);
+          });
+          stream.close(code);
+          return promise;
+        });
+      }
+      assert.deepStrictEqual(seen, {
+        [NGHTTP2_NO_ERROR]: ["aborted", "end:3000", "close:0"],
+        [NGHTTP2_CANCEL]: ["aborted", "end:3000", "close:8"],
+        [NGHTTP2_REFUSED_STREAM]: ["aborted", "end:3000", "error:ERR_HTTP2_STREAM_ERROR", "close:7"],
+        [NGHTTP2_INTERNAL_ERROR]: ["aborted", "end:3000", "error:ERR_HTTP2_STREAM_ERROR", "close:2"],
+      });
+    });
+
     test("close(7) under pipeline(stream, sink, cb): diagnostics channel", async () => {
       const channel = `http2.${side}.stream.close`;
       const published: number[] = [];

@@ -2229,6 +2229,12 @@ function markStreamClosed(stream: Http2Stream) {
     markWritableDone(stream);
   }
 }
+// close() stores its code before it ends the writable, and that end() can close the stream while
+// close() is still running (the peer's half had ended). The stored code is then the code of the
+// reset close() sends next, not a reason to destroy the stream before its consumer drained it.
+function isInsideClose(status: number) {
+  return (status & (StreamState.Closed | StreamState.CloseRecorded)) === StreamState.CloseRecorded;
+}
 function rstNextTick(id: number, rstCode: number) {
   const session = this as Http2Session;
   session[bunHTTP2Native]?.rstStream(id, rstCode);
@@ -2575,23 +2581,37 @@ class Http2Stream extends (Duplex as Http2StreamBase) {
       }
       // Like node's closeStream, the code is stored before the user code below can run (push(null),
       // 'aborted', end()): stream.pipeline() destroys the stream from inside 'aborted'.
+      const previousCode = this.rstCode;
       this.rstCode = code;
       this[bunHTTP2StreamStatus] |= StreamState.CloseRecorded;
-      if (this.pending || code === NGHTTP2_NO_ERROR || code === NGHTTP2_CANCEL) {
-        // For other rstCodes _destroy ends the readable so 'end' is suppressed.
-        this.push(null);
-      }
-      const { ending } = this._writableState;
-      if (!ending) {
-        // If the writable side of the Http2Stream is still open, emit the
-        // 'aborted' event and set the aborted flag.
-        if (!this.aborted) {
-          this[kAborted] = true;
-          this.emit("aborted");
+      try {
+        if (this.pending || code === NGHTTP2_NO_ERROR || code === NGHTTP2_CANCEL) {
+          // For other rstCodes _destroy ends the readable so 'end' is suppressed.
+          this.push(null);
         }
-        this.end();
+        const { ending } = this._writableState;
+        if (!ending) {
+          // If the writable side of the Http2Stream is still open, emit the
+          // 'aborted' event and set the aborted flag.
+          if (!this.aborted) {
+            this[kAborted] = true;
+            this.emit("aborted");
+          }
+          this.end();
+        }
+      } catch (err) {
+        // A listener threw and the stream is still open: this close() did not happen, and the caller
+        // can call close() again.
+        if ((this[bunHTTP2StreamStatus] & StreamState.Closed) === 0) {
+          this[bunHTTP2StreamStatus] &= ~StreamState.CloseRecorded;
+          this.rstCode = previousCode;
+        }
+        throw err;
       }
       markStreamClosed(this);
+      // A listener above destroyed the stream: _destroy cleared the session link and took over the
+      // reset, with the code stored above.
+      if (this[bunHTTP2Session] === null) return;
       if (this.pending) {
         // No id yet (the HEADERS frame is still queued behind connect/concurrency limits): the
         // RST_STREAM has to be sent after the HEADERS frame, once the id is assigned.
@@ -4118,11 +4138,12 @@ class ServerHttp2Session extends Http2Session {
       }
       // 7 = closed, in this case we already send everything and received everything
       if (state === 7) {
-        stream[bunHTTP2StreamStatus] |= StreamState.NativeClosed;
+        const status = stream[bunHTTP2StreamStatus];
+        stream[bunHTTP2StreamStatus] = status | StreamState.NativeClosed;
         markStreamClosed(stream);
         self.#connections--;
         if (stream.id % 2 === 1) self.#peerInitiatedStreams--;
-        if (stream.readable && !stream.rstCode) {
+        if (stream.readable && (!stream.rstCode || isInsideClose(status))) {
           // Clean close while data is still buffered on the readable side (e.g. the response
           // ended before the request body was consumed): node defers the destroy until the
           // consumer drains it ('end'), so the buffered request body is not lost.
@@ -5119,10 +5140,11 @@ class ClientHttp2Session extends Http2Session {
 
       // 7 = closed, in this case we already send everything and received everything
       if (state === 7) {
-        stream[bunHTTP2StreamStatus] |= StreamState.NativeClosed;
+        const status = stream[bunHTTP2StreamStatus];
+        stream[bunHTTP2StreamStatus] = status | StreamState.NativeClosed;
         markStreamClosed(stream);
         self.#connections--;
-        if (stream.readable && !stream.rstCode) {
+        if (stream.readable && (!stream.rstCode || isInsideClose(status))) {
           // Clean close while data is still buffered on the readable side: node defers the
           // destroy until the consumer drains it ('end'), so a late-attaching reader does not
           // lose data.

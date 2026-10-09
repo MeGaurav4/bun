@@ -2197,6 +2197,26 @@ describe("close(code) reset code", () => {
     },
   };
 
+  /**
+   * An 'aborted' listener throws out of close(2). That close did not happen: the stream shows
+   * `stillOpen`, and the close(code) that follows runs.
+   */
+  function closeAgainAfterThrow(stream: http2.Http2Stream) {
+    stream.once("aborted", () => {
+      throw new Error("boom");
+    });
+    let thrown: unknown;
+    try {
+      stream.close(ErrorCode.INTERNAL_ERROR);
+    } catch (err) {
+      thrown = (err as Error).message;
+    }
+    const seen = { thrown, closed: stream.closed, rstCode: stream.rstCode };
+    stream.close(codeOf[stream.id!]);
+    return seen;
+  }
+  const stillOpen = { thrown: "boom", closed: false, rstCode: undefined };
+
   const isHeaders = (sid: number) => (f: Frame) => f.type === FrameType.HEADERS && f.streamId === sid;
   const isReset = (sid: number) => (f: Frame) => f.type === FrameType.RST_STREAM && f.streamId === sid;
   const isPingAck = (opaque: number) => (f: Frame) =>
@@ -2290,7 +2310,7 @@ describe("close(code) reset code", () => {
     test("close(code) under pipeline(stream, sink, cb) after respond()", async () => {
       const server = http2.createServer();
       await withRawClient(server, async c => {
-        server.on("stream", stream => {
+        server.on("stream", (stream: http2.ServerHttp2Stream) => {
           stream.on("error", () => {});
           stream.respond({ ":status": 200 });
           pipeline(stream, discard(), () => {});
@@ -2322,6 +2342,48 @@ describe("close(code) reset code", () => {
         c.send(upload(1));
         await resetsThenTwoPings(c, [1]);
         expect([...new Set(c.frames.filter(isReset(1)).map(f => f.payload.readUInt32BE(0)))]).toEqual([7]);
+      });
+    });
+
+    // A server counts each REFUSED_STREAM reset that it submits against maxSessionRejectedStreams,
+    // and answers with GOAWAY at the limit. Two resets for one stream count twice.
+    test("close(7) under pipeline(stream, sink, cb) submits one reset for each stream", async () => {
+      const server = http2.createServer({ maxSessionRejectedStreams: sids.length + 1 });
+      await withRawClient(server, async c => {
+        server.on("stream", stream => {
+          stream.on("error", () => {});
+          pipeline(stream, discard(), () => {});
+          stream.close(ErrorCode.REFUSED_STREAM);
+          ping(c, 0);
+        });
+        c.send(Buffer.concat(sids.map(upload)));
+        // A session that sent GOAWAY answers no ping. The assertion shows the GOAWAY.
+        await resetsThenTwoPings(c).catch(() => {});
+        expect({
+          goaway: c.frames.filter(f => f.type === FrameType.GOAWAY).length,
+          resets: sids.map(sid => c.frames.filter(isReset(sid)).map(f => f.payload.readUInt32BE(0))),
+        }).toEqual({ goaway: 0, resets: [[7], [7], [7]] });
+      });
+    });
+
+    test("close(code) again after an 'aborted' listener threw", async () => {
+      const server = http2.createServer();
+      await withRawClient(server, async c => {
+        const afterThrow: unknown[] = [];
+        const closed: Promise<unknown>[] = [];
+        server.on("stream", stream => {
+          stream.on("error", () => {});
+          closed.push(new Promise(resolve => stream.on("close", resolve)));
+          afterThrow.push(closeAgainAfterThrow(stream));
+          ping(c, 0);
+        });
+        c.send(Buffer.concat(sids.map(upload)));
+        await resetsThenTwoPings(c);
+        expect({ afterThrow, resets: resetCodes(c.frames) }).toEqual({
+          afterThrow: sids.map(() => stillOpen),
+          resets: theGivenCode,
+        });
+        await Promise.all(closed);
       });
     });
   });
@@ -2358,5 +2420,23 @@ describe("close(code) reset code", () => {
         });
       });
     }
+
+    test("close(code) again after an 'aborted' listener threw", async () => {
+      await withRawServer(async (client, raw) => {
+        const afterThrow: unknown[] = [];
+        const closed: Promise<unknown>[] = [];
+        for (const req of await openUploads(client, raw, sids.length)) {
+          closed.push(new Promise(resolve => req.on("close", resolve)));
+          afterThrow.push(closeAgainAfterThrow(req));
+          ping(raw, 0);
+        }
+        await resetsThenTwoPings(raw);
+        expect({ afterThrow, resets: resetCodes(raw.frames) }).toEqual({
+          afterThrow: sids.map(() => stillOpen),
+          resets: theGivenCode,
+        });
+        await Promise.all(closed);
+      });
+    });
   });
 });
